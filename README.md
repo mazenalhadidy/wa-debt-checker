@@ -55,9 +55,9 @@
 التفاصيل في `READ-ME.txt` داخل المجلد. ويصنعها CI أيضًا مع كل دفع (Artifact باسم `wa-debt-checker-ready`).
 
 ## التشغيل على Netlify
-1. Netlify ← Add new site ← Import from Git ← المستودع `elbshmds` ← **Base directory: `ai-tool`** ← Deploy.
+1. Netlify ← Add new site ← Import from Git ← المستودع `wa-debt-checker` ← Deploy.
 2. Environment variables: `ANTHROPIC_API_KEY` (من console.anthropic.com، مع وضع حد شهري للإنفاق) و`APP_PASSWORD` (١٢ حرفًا أو أكثر). ثم Trigger deploy.
-3. كل دفع إلى `main` ينشر الأداة تلقائيًا، ولكن فقط إذا تغيّر شيء داخل `ai-tool/`.
+3. كل دفع إلى `main` ينشر الأداة تلقائيًا (يمكن إيقافه من Netlify: Deploys ← Stop auto publishing).
 اختياري: `MODEL_FAST` / `MODEL_STRONG` لتغيير النماذج.
 
 ## على الحاسوب

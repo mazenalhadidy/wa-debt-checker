@@ -1,8 +1,6 @@
-# Netlify (CD for the AI tool): in Netlify set "Base directory" = ai-tool. Every push to main deploys it,
-# but only when something inside ai-tool/ changed (the "ignore" line), so shop-only commits cost no build.
+# Netlify (CD for the AI tool): every push to main deploys it.
 [build]
   publish = "public"
-  ignore = "git diff --quiet $CACHED_COMMIT_REF $COMMIT_REF -- ."
 
 [build.environment]
   NODE_VERSION = "22"

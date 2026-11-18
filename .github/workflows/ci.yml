@@ -1,0 +1,29 @@
+# CI of the WhatsApp debt checker: tests, then the ready-to-use Windows package (artifact "wa-debt-checker-ready").
+# Netlify deploys the site from this repository by itself.
+name: CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      - name: Build the ready-to-use package (unzip + START.cmd, no install)
+        run: npm run package
+      - uses: actions/upload-artifact@v4
+        with: { name: wa-debt-checker-ready, path: release/wa-debt-checker, retention-days: 30 }
