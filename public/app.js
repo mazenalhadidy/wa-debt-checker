@@ -44,7 +44,7 @@ async function ai(task, input, { image = null, images = null, tier = 'fast', tra
       return v.data;
     } catch (e) {
       if (e instanceof Unauthorized) { showLogin('تغيّرت كلمة المرور، سجّل الدخول مجددًا.'); throw e; }
-      if (t > 0 || e.code === 400 || e.code === 422) throw e;
+      if (t > 0 || [400, 402, 413, 422].includes(e.code)) throw e;          // trying again would not help
       await sleep(e.code === 429 || e.code === 529 ? 8000 : 1500);
     }
   }

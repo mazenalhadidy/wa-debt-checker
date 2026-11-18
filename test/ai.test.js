@@ -110,3 +110,10 @@ test('a key Claude refuses: the message names the key by its hint and what to do
   client.apiKey = 'sk-ant-api03-' + 'B'.repeat(80) + 'q1w2';
   await assert.rejects(runTask(client, { task: 'text', input: 'x' }), e => /sk-ant-api03-…q1w2/.test(e.message) && /console\.anthropic\.com/.test(e.message));
 });
+
+test('no credit in the API account: an Arabic message that says where to add it', async () => {
+  const calls = [];
+  const fetch = async (url, init) => { calls.push(1); return new Response(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.' } }), { status: 400, headers: { 'content-type': 'application/json' } }); };
+  const client = new Anthropic({ apiKey: 'test', fetch, maxRetries: 0 });
+  await assert.rejects(runTask(client, { task: 'text', input: 'x' }), e => e.status === 402 && /Billing/.test(e.message) && /Claude Pro/.test(e.message));
+});
