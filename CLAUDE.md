@@ -5,7 +5,7 @@ Netlify (edge function + blobs) or local (`local/server.mjs`, Claude or Ollama).
 repository: `mazenalhadidy/elbshmds`. Details: `README.md`. Every change is small and in the existing style.
 
 ## How to work with the owner
-- **Never push to GitHub** unless he asks in that message. Commit, then give him the ready zip:
+- **Always push** every finished change to `main` (he asked; Netlify publishes it). Also give him the ready zip:
   `npm run package` → `release/wa-debt-checker.zip` (copy to `<scratchpad>/wa-debt-checker-READY.zip`),
   and the shop zip too — **both zips are ALWAYS the last thing of every final reply**.
 - **Screenshots**: none while working; at the END send the ones taken while testing (phone 390 px first).
