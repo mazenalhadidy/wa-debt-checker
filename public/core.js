@@ -428,3 +428,52 @@ export function cleanActions(actions, { rows, senders }) {
     return false;
   });
 }
+
+/* ===== the whole chat in one request (read like a person reads it in a Claude chat) ===== */
+/**
+ * Where to start sending: the newest messages that fit one request (text size, number of pictures, messages).
+ * The start of the account is found by the model inside this window.
+ */
+export function pickWindow(rows, { maxChars = 90_000, maxImages = 80, maxMsgs = 3000 } = {}) {
+  let chars = 0, imgs = 0, n = 0, from = rows.length;
+  for (let k = rows.length - 1; k >= 0; k--) {
+    const r = rows[k];
+    if (r.sys) { from = k; continue; }
+    const add = (r.text || '').length + 40, pic = r.img ? 1 : 0;
+    if (chars + add > maxChars || imgs + pic > maxImages || n + 1 > maxMsgs) break;
+    chars += add; imgs += pic; n++; from = k;
+  }
+  return from;
+}
+/** The chat as the model reads it, with what the owner already said (rules of this group, start, fixes, who is who). */
+export function wholeInput(rows, { chat = '', sent = new Set(), groupRules = [], shopHint = [], start = null, opening = null, fixes = [] } = {}) {
+  const head = [];
+  if (chat) head.push('المحادثة: ' + chat);
+  if (groupRules.length) head.push('قواعد هذا الجروب (من صاحب المحل، طبّقها):\n' + groupRules.map((x, k) => `${k + 1}. ${x}`).join('\n'));
+  if (shopHint.length) head.push('عُرف سابقًا أن هؤلاء من المحل (قرينة، تحقق منها): ' + shopHint.join('، '));
+  if (start != null) head.push(`صاحب المحل حدّد البداية: الرسالة #${start}${opening != null ? ` برصيد ${opening}` : ''}.`);
+  else if (opening != null) head.push(`صاحب المحل حدّد رصيد البداية: ${opening}.`);
+  if (fixes.length) head.push('تصحيحات صاحب المحل في هذه المحادثة (صحيحة دائمًا):\n' + fixes.map(f => `#${f.i} = ${f.kind === 'ignore' ? 'ليست من الحساب' : (f.kind === 'sent' ? 'أرسلنا له ' : 'استلمنا منه ') + f.amount}`).join('\n'));
+  const line = r => {
+    const what = r.img ? (sent.has(r.i) ? `[صورة #${r.i} مرفقة]` : '[صورة لم تُرفق]') + (r.text ? ' ' + r.text : '')
+      : r.state === 'done' && !r.text ? `[${r.why || 'مرفق'}]` : (r.text || '').replace(/\n/g, ' ⏎ ');
+    return `#${r.i} | ${r.ts} | ${r.sender} | ${what}`;
+  };
+  return `${head.join('\n\n')}${head.length ? '\n\n' : ''}الرسائل:\n${rows.filter(r => !r.sys).map(line).join('\n')}`;
+}
+/** The model's answer, kept to what makes sense for this chat (real message numbers, amounts > 0, known senders). */
+export function readWhole(v, { rows, senders }) {
+  const has = new Set(rows.filter(r => !r.sys).map(r => r.i));
+  const seen = new Set();
+  const items = (Array.isArray(v?.items) ? v.items : []).filter(x => has.has(x.i) && ['sent', 'received'].includes(x.kind) && num(x.amount) > 0 && !seen.has(x.i) && seen.add(x.i))
+    .map(x => ({ i: x.i, kind: x.kind, amount: num(x.amount), why: String(x.why || '') }));
+  const startI = has.has(v?.start?.i) ? v.start.i : null;
+  const balance = num(v?.start?.balance) ?? 0;
+  const own = items.filter(x => startI == null || x.i > startI).reduce((a, x) => a + (x.kind === 'sent' ? x.amount : -x.amount), balance);
+  return {
+    shop: (Array.isArray(v?.shop) ? v.shop : []).map(String).filter(n => senders.includes(n)),
+    start: { i: startI, balance, why: String(v?.start?.why || '') },
+    items, summary: String(v?.summary || ''),
+    total: own, said: num(v?.total), agrees: num(v?.total) == null || Math.abs(num(v.total) - own) < 1,
+  };
+}

@@ -1,13 +1,11 @@
-// The page: give it the chat (zip / txt / pictures + copied messages) and it does everything by itself:
-// who is the shop, where the account starts (the last closing), every message, the final calculation.
+// The page: give it the chat (zip / txt / pictures + copied messages) and it does everything by itself, in ONE request
+// to the strong model with the text and the pictures (like a Claude chat): who is the shop, the start, the calculation.
 // Then you talk to it («صحّح أو اسأل») and it fixes the calculation; the messages below can be fixed by hand.
 // Logic lives in core.js; the prompts and rules live on the server (lib/ai.js).
 import {
-  esc, fmt, num, clamp, KIND, IMG, MEDIA, parse, strip, prep, applyAnswer, weak,
-  dedupeRefs, totals, lines, imageInput, exampleLine, trainingText, pool,
-  roleFromHistory, recordRoles, seedStats, rolesInput, decideRoles,
-  linkGroups, transactions, statementCheckpoints, statementCp, mergeCheckpoints, equation, reconcile, expression, expressionHtml,
-  parseStatement, isTransaction, chatInput, cleanActions, keywordCheckpoints,
+  esc, fmt, num, KIND, IMG, MEDIA, parse, prep, totals, exampleLine, trainingText,
+  roleFromHistory, recordRoles, seedStats, decideRoles, transactions, equation, reconcile, expressionHtml,
+  chatInput, cleanActions, pickWindow, wholeInput, readWhole,
 } from './core.js';
 
 const $ = s => document.querySelector(s);
@@ -16,16 +14,13 @@ const mime = f => ({ jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', we
 const show = (el, on = true) => $(el).classList.toggle('hide', !on);
 
 /* ===== state ===== */
-const DEF = { shop: [], shopStats: {}, runs: 0, keywords: [], rules: [], learned: '', segs: [], selfChecked: 0 };
+const DEF = { shop: [], shopStats: {}, runs: 0, keywords: [], rules: [], groups: {}, learned: '', segs: [], selfChecked: 0 };
 const KEEP = 39;                    // newest corrections sent as they are; older ones are merged into one summary
-const IMG_AT_ONCE = 4, TEXT_AT_ONCE = 2, BATCH = 40;
 let settings = structuredClone(DEF), examples = [], key = '';
-let msgs = [], media = new Map(), shop = new Set(), senders = [], cps = [], openIdx = -1, rows = [], busy = false, chatName = '', stopped = false, spent = 0;
+let msgs = [], media = new Map(), shop = new Set(), senders = [], openIdx = -1, rows = [], busy = false, chatName = '', spent = 0;
 let cp = null, startIdx = -1, opening = 0;  // the start; where the analysis starts (before it when checking a statement); the signed opening
 // what you told it (kept when it reads the chat again): your start, your opening, your fixes per message
 let pinnedStart = null, pinnedOpening = null, fixes = new Map(), talk = [];
-const imgCache = new Map();                 // message index -> the image answer (never pay twice for the same picture)
-const START_WORDS = ['بدايتنا', 'بداية الحساب', 'بداية حسابنا', 'اولنا', 'اول الحساب', 'اول حسابنا', 'هنبدا من', 'نبدا من'];
 const PICS = 'صور';                         // sender name of pasted / picked pictures (counted as the shop)
 const has = f => media.has(f);
 
@@ -41,14 +36,14 @@ async function api(path, opts = {}) {
   return v;
 }
 /** Ask the AI to do one task. tier: fast (default) or strong. Retries once (longer after rate limits). */
-async function ai(task, input, { image = null, tier = 'fast', training = trainingText(settings, examples) } = {}) {
+async function ai(task, input, { image = null, images = null, tier = 'fast', training = trainingText(settings, examples) } = {}) {
   for (let t = 0; ; t++) {
     try {
-      const v = await api('/api/analyze', { method: 'POST', body: JSON.stringify({ task, tier, training, input, image }) });
+      const v = await api('/api/analyze', { method: 'POST', body: JSON.stringify({ task, tier, training, input, image, ...(images ? { images } : {}) }) });
       spent += v.cost || 0;
       return v.data;
     } catch (e) {
-      if (e instanceof Unauthorized) { stopped = true; showLogin('تغيّرت كلمة المرور، سجّل الدخول مجددًا.'); throw e; }
+      if (e instanceof Unauthorized) { showLogin('تغيّرت كلمة المرور، سجّل الدخول مجددًا.'); throw e; }
       if (t > 0 || e.code === 400 || e.code === 422) throw e;
       await sleep(e.code === 429 || e.code === 529 ? 8000 : 1500);
     }
@@ -97,7 +92,7 @@ $('#file').addEventListener('change', async e => {
       txt = await chat.async('string');
       for (const z of ents) { const b = z.name.split('/').pop(); if (MEDIA.test(b)) media.set(b.toLowerCase(), z); }
     } else txt = await f.text();
-    msgs = parse(txt); imgCache.clear();
+    msgs = parse(txt);
     if (!msgs.length) throw new Error('هذا ليس ملف تصدير من واتساب.');
     chatName = f.name.replace(/\.(zip|txt)$/i, '').replace(/^WhatsApp Chat( with| -)?\s*/i, '');
     $('#fileLabel').textContent = `${f.name} · ${msgs.length} رسالة · ${[...media.keys()].filter(k => IMG.test(k)).length} صورة`;
@@ -132,7 +127,7 @@ $('#usePics').addEventListener('click', () => {
   const txt = $('#pasteText').value.trim();
   let list = txt ? parse(txt) : [];
   if (txt && !list.length) list = txt.split(/\n+/).map(t => t.trim()).filter(Boolean).map(t => ({ sender: 'رسالة منسوخة', ts: '', text: t }));
-  media = new Map(); imgCache.clear();
+  media = new Map();
   inbox.forEach((f, k) => { const name = `pic-${k + 1}.${picExt(f)}`; media.set(name, { async: () => Promise.resolve(f) }); list.push({ sender: PICS, ts: 'صورة ' + (k + 1), text: name + ' (file attached)' }); });
   msgs = list.map((m, i) => ({ ...m, i }));
   if (!msgs.length) return;
@@ -144,265 +139,103 @@ $('#usePics').addEventListener('click', () => {
 
 $('#again').addEventListener('click', () => $('#step1').classList.remove('loaded'));
 
-/* ===== everything by itself ===== */
+/* ===== everything by itself: the whole chat in ONE request, read like a Claude chat reads it ===== */
+let allRows = [], from = 0;
+const MAX_IMAGES = 80, IMG_BUDGET = 4_400_000;           // what one request carries (the server accepts up to 4.6 MB of pictures)
 /** A new chat: forget what was said about the previous one, then read it. */
 function start() {
   $('#step1').classList.add('loaded');
-  pinnedStart = null; pinnedOpening = null; fixes = new Map(); talk = []; imgCache.clear();
+  pinnedStart = null; pinnedOpening = null; fixes = new Map(); talk = [];
   $('#log').innerHTML = '';
   const cnt = new Map();
   for (const m of msgs) if (m.sender && !m.sys) cnt.set(m.sender, (cnt.get(m.sender) || 0) + 1);
   senders = [...cnt].sort((a, b) => b[1] - a[1]).map(([n]) => n);
-  analyze({ roles: true });
+  analyze();
 }
-/** Who is the shop: your past answers, checked by the AI in every chat (names can change). Never asks. */
-async function decideWho() {
-  settings.shopStats = seedStats(settings.shopStats, settings.shop);
-  let d = decideRoles(senders, settings.shopStats, null, { always: [PICS] });
-  try {
-    $('#progText').textContent = 'أتعرّف على أطراف المحادثة…';
-    const known = Object.keys(settings.shopStats).filter(n => roleFromHistory(settings.shopStats, n) === 'shop');
-    const v = await ai('roles', rolesInput(msgs, senders.filter(n => n !== PICS), { chat: chatName, known, history: settings.shopStats }), { tier: 'strong' });
-    d = decideRoles(senders, settings.shopStats, new Map((v?.roles || []).map(x => [String(x.sender), x])), { always: [PICS] });
-  } catch { /* keep the guess from your answers */ }
-  shop = d.shop;
-  // a known name that now looks like the other side: never changed silently
-  if (d.changed.length) say(d.changed.map(c => `⚠️ «${c.name}» كان ${c.was === 'shop' ? 'من المحل' : 'عميلًا'} سابقًا، ويبدو الآن ${c.now === 'shop' ? 'من المحل' : 'عميلًا'}.`).join('\n'));
+/** The pictures of the window as small JPEGs, newest first until the budget is used (each named by its message). */
+async function packImages(list) {
+  const out = []; let size = 0;
+  for (const r of [...list].reverse()) {
+    if (!r.img || out.length >= MAX_IMAGES) continue;
+    try {
+      await loadBlob(r);
+      const data = await toB64(await shrink(r.blob, 1100, 0.7));
+      if (size + data.length > IMG_BUDGET) break;
+      size += data.length; out.push({ i: r.i, data });
+    } catch { /* a picture that cannot be read is sent as «[صورة لم تُرفق]» */ }
+  }
+  return out.reverse();
 }
-/** Read the chat and calculate. roles: decide who is who first (a new chat). */
-async function analyze({ roles = false } = {}) {
+const groupRules = () => settings.groups?.[chatName] || [];
+/** Read the chat and calculate: one request to the strong model with the text, the pictures and what you told it. */
+async function analyze() {
   if (busy) return;
-  busy = true; stopped = false; spent = 0; lockTalk();
-  show('#sum'); show('#talk'); show('#step3'); show('#barBox'); $('#prog').style.width = '3%';
+  busy = true; spent = 0; lockTalk(); show('#retry', false);
+  show('#sum'); show('#talk'); show('#step3'); show('#barBox'); $('#prog').style.width = '10%';
   try {
-    if (roles) await decideWho();
-    if (!shop.size) { say('لم أعرف من يمثّل المحل. اكتب لي اسمه.'); return; }
+    allRows = msgs.map(m => prep(m, { shop, has }));
+    from = pickWindow(allRows, { maxImages: MAX_IMAGES });
+    const list = allRows.slice(from);
+    $('#progText').textContent = `أجهّز ${list.filter(r => !r.sys).length} رسالة…`;
+    const images = await packImages(list);
+    $('#prog').style.width = '35%';
+    $('#progText').textContent = 'أقرأ المحادثة وأحسب…';
+    settings.shopStats = seedStats(settings.shopStats, settings.shop);
+    const known = senders.filter(n => roleFromHistory(settings.shopStats, n) === 'shop' || shop.has(n));
+    const input = wholeInput(list, {
+      chat: chatName, sent: new Set(images.map(x => x.i)), groupRules: groupRules(), shopHint: known,
+      start: pinnedStart, opening: pinnedOpening, fixes: [...fixes].map(([i, f]) => ({ i, ...f })),
+    });
+    const tick = setInterval(() => { const w = parseFloat($('#prog').style.width) || 35; $('#prog').style.width = Math.min(92, w + 2) + '%'; }, 1500);
+    let v;
+    try { v = readWhole(await ai('whole', input, { tier: 'strong', images }), { rows: allRows, senders }); }
+    finally { clearInterval(tick); }
+    // who is the shop: the model's reading (pictures pasted by you always count as the shop)
+    shop = new Set([...v.shop, ...(senders.includes(PICS) ? [PICS] : [])]);
+    if (!shop.size) shop = decideRoles(senders, settings.shopStats, null, { always: [PICS] }).shop;
     settings.shopStats = recordRoles(settings.shopStats, senders.filter(n => n !== PICS), shop);
     settings.shop = Object.keys(settings.shopStats).filter(n => roleFromHistory(settings.shopStats, n) === 'shop');
     settings.runs = (settings.runs || 0) + 1; persist('settings');
-    allRows = msgs.map(m => prep(m, { shop, has })); analyzedFrom = msgs.length; cps = []; cp = null; rows = [];
-    let done = 0;
-    const step = () => { done++; $('#prog').style.width = Math.min(95, 100 * done / Math.max(1, allRows.filter(r => r.state === 'pending').length / 20 + done)) + '%'; renderSoon(); };
-    let from;
-    if (pinnedStart != null) from = await startAt(pinnedStart, step);
-    else { from = await understand(step); if (!stopped) await useStart(cps.length - 1); }
+    // the result on the messages: what counts, and why
+    const by = new Map(v.items.map(x => [x.i, x]));
+    for (const r of allRows) {
+      r.side = shop.has(r.sender) ? 'shop' : 'client';
+      if (r.sys) continue;
+      const x = by.get(r.i);
+      r.state = 'done'; r.conf = 1; r.flag = false; delete r.start; delete r.partOf;
+      if (x) { r.kind = x.kind; r.amount = x.amount; r.why = x.why; } else { r.kind = 'ignore'; if (!r.why) r.why = ''; }
+      r.ai = { kind: r.kind, amount: r.amount };
+    }
+    openIdx = v.start.i ?? from - 1; startIdx = openIdx; opening = v.start.balance; cp = null;
+    if (v.start.i != null) { const s0 = allRows[v.start.i]; s0.start = true; s0.kind = 'ignore'; s0.why = v.start.why; }
     reapplyFixes();
     if (pinnedOpening != null) opening = pinnedOpening;
-    $('#progText').textContent = stopped ? 'توقّف. سجّل الدخول ثم اختر المحادثة مرة أخرى.' : `قرأتُ ${msgs.length - Math.min(from, analyzedFrom)} رسالة · ≈ $${spent.toFixed(3)}`;
-    if (!stopped && !cp && pinnedStart == null) say(`لم أجد إقفالًا للحساب، فحسبتُ من ${analyzedFrom > 0 ? msgs[analyzedFrom]?.ts || 'أول ما قرأتُه' : 'أول المحادثة'} برصيد ٠. إن كنت تعرف الرصيد فاكتبه لي.`);
-    if (!stopped) learnFromHistory();
+    rows = allRows.slice(from);
+    $('#progText').textContent = `قرأتُ ${list.filter(r => !r.sys).length} رسالة و${images.length} صورة · ≈ $${spent.toFixed(3)}`;
+    if (v.summary) say(v.summary);
+    if (!v.agrees) say(`⚠️ كتبتُ المجموع ${fmt(v.said)} لكن جمع العمليات ${fmt(v.total)}؛ المعروض هو جمع العمليات.`);
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) { say(e.message || 'تعذّر الاتصال.'); show('#retry'); }
+    $('#progText').textContent = '';
   } finally {
     busy = false; show('#barBox', false); unlockTalk(); render();
   }
 }
+$('#retry').addEventListener('click', () => analyze());
 
-/* ===== understanding the chat: where was the account last closed? =====
-   No fixed word. The AI reads the end of the chat (texts + what the pictures show) like an accountant:
-   a calculator total, «الحساب كده»، a day-end balance, an agreed number… = the account closed there, and the
-   next day starts from that balance. If the end of the chat has no closing, it reads further back. */
-const WINDOW = 150, MAX_BACK = 900;
-let allRows = [], analyzedFrom = 0;
-
-/** Closings the AI sees in rows[from..], merged with typed/pictured calculator statements. */
-async function findClosings(from) {
-  const part = allRows.slice(from);
-  const typed = statementCheckpoints(part.map(r => msgs[r.i]));
-  const pics = part.filter(r => r.calc?.terms?.length >= 2).map(r => statementCp(r.i, { terms: r.calc.terms, total: r.calc.total }));
-  let found = [];
-  try {
-    const v = await ai('closings', lines(part), { tier: 'strong' });
-    found = (v?.closings || []).map(c => ({ i: Number(c.i), amount: Math.abs(num(c.balance) ?? NaN), dir: num(c.balance) < 0 ? 'shop_owes' : 'client_owes', conf: clamp(c.confidence), why: String(c.why || ''), kind: c.kind }))
-      .filter(c => allRows[c.i] && c.i >= from && Number.isFinite(c.amount) && c.conf >= 0.6);
-  } catch { /* typed / pictured statements still work */ }
-  // a closing on the result picture right after its statement = the statement
-  found = found.map(c => {
-    const st = pics.find(p => p.i <= c.i && c.i - p.i <= 3 && Math.abs(p.stated - c.amount * (c.dir === 'shop_owes' ? -1 : 1)) < 1);
-    return st ? { ...st, why: c.why || st.why } : c;                  // keep the AI's reason
-  });
-  // safety net: «بدايتنا ١٢ الف» / «أولنا …» with a number, when the AI saw nothing at that message
-  const words = keywordCheckpoints(part.map(r => msgs[r.i]), START_WORDS).map(c => ({ ...c, why: 'بداية الحساب: ' + strip(msgs[c.i].text).slice(0, 60) }));
-  return mergeCheckpoints(found, typed, pics, words);
-}
-/** Make sure every row from `from` to the end is analyzed (pictures cached, nothing paid twice). */
-async function analyzeFrom(from, onStep) {
-  if (allRows.slice(from).every(r => r.state !== 'pending')) { analyzedFrom = Math.min(analyzedFrom, from); return; }
-  await runAnalysis(allRows.slice(from), onStep);
-  analyzedFrom = Math.min(analyzedFrom, from);
-}
-async function understand(onStep) {
-  let from = Math.max(0, msgs.length - WINDOW);
-  for (;;) {
-    $('#progText').textContent = `أقرأ آخر ${msgs.length - from} رسالة…`;
-    await analyzeFrom(from, onStep);
-    cps = await findClosings(from);
-    const last = cps[cps.length - 1];
-    const enough = last && (!last.terms || cps.length > 1);   // a statement is checked against what came before it
-    if (enough || from === 0 || msgs.length - from >= MAX_BACK || stopped) return from;
-    from = Math.max(0, from - WINDOW);
-  }
-}
-/** The closing a row itself shows: a calculator statement, its result, or a typed statement. */
-function closingOf(r) {
-  if (r.calc?.terms?.length >= 2) return statementCp(r.i, r.calc);
-  const typed = parseStatement(msgs[r.i].text); if (typed) return statementCp(r.i, typed);
-  if (r.calc) {
-    const st = allRows.slice(Math.max(0, r.i - 3), r.i).reverse().find(x => x.calc?.terms?.length >= 2 && Math.abs(x.calc.total - r.calc.total) < 1);
-    return st ? statementCp(st.i, st.calc) : { i: r.i, amount: Math.abs(r.calc.total), dir: r.calc.total < 0 ? 'shop_owes' : 'client_owes', conf: 1, why: 'ناتج آلة حاسبة' };
-  }
-  return null;
-}
-
-/**
- * Start at message i (you chose it). If it closes the account (calculator, result, agreed balance) its balance
- * opens the new account; if it is a transfer it is the first operation; otherwise the account starts after it at 0.
- */
-async function startAt(i, onStep) {
-  await analyzeFrom(Math.max(0, i - 3), onStep);
-  const r = allRows[i];
-  let c = closingOf(r);
-  if (!c && !isTransaction(r)) c = (await findClosings(i)).find(x => x.i === i) || null;
-  if (c) {
-    cps = [c];
-    if (c.terms) {                                   // a statement: also check it against what came before
-      const back = Math.max(0, c.i - WINDOW); await analyzeFrom(back, onStep);
-      cps = mergeCheckpoints((await findClosings(back)).filter(x => x.i < c.i), [c]);
-    }
-    cp = cps.find(x => x.i === c.i); cp.chosen = true;
-    await useStart(cps.indexOf(cp));
-    return Math.min(i, analyzedFrom);
-  }
-  cp = null; cps = []; opening = 0;
-  openIdx = isTransaction(r) ? i - 1 : i; startIdx = openIdx;
-  rows = allRows.slice(startIdx + 1);
-  for (const x of allRows) delete x.start;
-  render();
-  return i;
-}
-/** Use closing k as the start: its balance opens the new account; a statement is also checked. */
-async function useStart(k) {
-  cp = cps[k] || null; openIdx = cp ? cp.i : analyzedFrom - 1;
-  opening = cp ? cp.amount * (cp.dir === 'shop_owes' ? -1 : 1) : 0;
-  startIdx = cp?.terms ? Math.max(analyzedFrom - 1, ...cps.filter(c => c.i < cp.i).map(c => c.i)) : openIdx;
-  if (startIdx + 1 < analyzedFrom) await analyzeFrom(startIdx + 1);
-  rows = allRows.slice(startIdx + 1);
-  for (const r of allRows) delete r.start;
-  for (const r of rows) if (cps.some(c => c.i === r.i) && r.i >= openIdx) { r.start = true; r.kind = 'ignore'; }
-  render();
-}
-
-/* ===== 3. analysis ===== */
-async function shrink(blob) {                       // max 1600 px JPEG: smaller upload, fewer image tokens, same reading
+async function shrink(blob, max = 1600, q = 0.85) {   // a smaller JPEG: smaller upload, fewer image tokens, same reading
   try {
     const url = URL.createObjectURL(blob);
     const img = await new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = rej; im.src = url; });
-    const s = Math.min(1, 1600 / Math.max(img.naturalWidth, img.naturalHeight));
+    const s = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
     const c = document.createElement('canvas'); c.width = Math.round(img.naturalWidth * s); c.height = Math.round(img.naturalHeight * s);
     c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(url);
-    return await new Promise(r => c.toBlob(b => r(b || blob), 'image/jpeg', 0.85));
+    return await new Promise(r => c.toBlob(b => r(b || blob), 'image/jpeg', q));
   } catch { return blob; }
 }
 const toB64 = blob => new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(String(fr.result).split(',')[1]); fr.onerror = rej; fr.readAsDataURL(blob); });
-const fail = (r, e) => { r.state = 'error'; r.kind = 'ignore'; r.flag = true; r.why = 'خطأ' + (e?.message ? ': ' + e.message : ''); r.ai = { kind: 'ignore', amount: null }; };
-
 async function loadBlob(r) {
   if (!r.blob) { const b = await media.get(r.file.toLowerCase()).async('blob'); r.blob = new Blob([b], { type: mime(r.file) }); r.url = URL.createObjectURL(r.blob); }
-}
-/** The AI's answer for a picture (cached by message). A weak answer is checked again by the strong model. */
-async function analyzeImage(r, list, training) {
-  if (imgCache.has(r.i)) return imgCache.get(r.i);
-  await loadBlob(r);
-  const image = await toB64(await shrink(r.blob)), input = imageInput(r, list);
-  let v = await ai('image', input, { image, training });
-  if (weak(v) && !(v?.calc?.terms?.length)) { try { const v2 = await ai('image', input, { image, training, tier: 'strong' }); if (v2) v = { ...v2, esc: true }; } catch { /* keep the first answer */ } }
-  imgCache.set(r.i, v);
-  return v;
-}
-async function doImage(r, list, training) {
-  try {
-    await loadBlob(r);
-    const v = await analyzeImage(r, list, training);
-    applyAnswer(r, v); r.esc = !!v.esc;
-    if (v.is_transfer === false) { r.kind = 'ignore'; r.ai.kind = 'ignore'; }
-    r.summary = String(v.summary || ''); r.ref = String(v.ref || '').replace(/\s/g, ''); r.app = String(v.app || '');
-    if (v.unclear) r.flag = true;
-    if (v.calc) {                            // calculator: a statement or just its result, never a new transfer
-      r.calc = { terms: (v.calc.terms || []).map(Number), total: num(v.calc.total) ?? (v.calc.terms || []).reduce((x, y) => x + Number(y), 0) };
-      r.kind = 'ignore'; r.ai.kind = 'ignore'; r.flag = false; r.amount = null;
-      r.why = v.calc.terms?.length >= 2 ? `كشف حساب: ${expression(v.calc.terms.map(Number))} = ${fmt(num(v.calc.total) ?? 0)}` : 'ناتج الآلة الحاسبة';
-    }
-  } catch (e) { fail(r, e); }
-}
-async function doText(batch, list, training, { tier = 'fast', context = null } = {}) {
-  if (!batch.length) return;
-  const a = list.indexOf(batch[0]), b = list.indexOf(batch[batch.length - 1]);
-  try {
-    const v = await ai('text', lines(context || list.slice(a, b + 1)), { training, tier });
-    const by = new Map(batch.map(r => [r.i, r]));
-    for (const it of v?.items || []) {
-      const r = by.get(Number(it.i)); if (!r) continue;
-      applyAnswer(r, it);
-      r.of = Array.isArray(it.of) ? it.of.map(Number).filter(j => j !== r.i) : [];
-      if (it.dup_of != null && r.kind !== 'ignore') { r.why += ` (مكررة مع #${it.dup_of})`; r.kind = 'ignore'; r.ai.kind = 'ignore'; }
-      by.delete(r.i);
-    }
-    if (tier === 'strong') return;                     // a second reading that skipped a message keeps the first one
-    for (const r of by.values()) { r.state = 'done'; r.flag = true; r.why = 'لم يصل رد لهذه الرسالة.'; }
-  } catch (e) { if (tier !== 'strong') batch.forEach(r => fail(r, e)); }
-}
-/** Images first (several at once), then the text in batches (they see the image results to avoid double counting). */
-async function runAnalysis(list, onStep = () => {}) {
-  const training = trainingText(settings, examples);      // the same text for every call -> served from the prompt cache
-  const imgs = list.filter(r => r.img && r.state === 'pending'), texts = list.filter(r => r.state === 'pending' && !r.img);
-  const batches = []; for (let k = 0; k < texts.length; k += BATCH) batches.push(texts.slice(k, k + BATCH));
-  const steps = imgs.length + batches.length;
-  await pool(imgs, IMG_AT_ONCE, async r => { await doImage(r, list, training); onStep(steps); }, () => stopped);
-  await pool(batches, TEXT_AT_ONCE, async b => { await doText(b, list, training); onStep(steps); }, () => stopped);
-  // not sure? the strong model reads those messages again with 5 messages around each — it decides, you don't
-  const unsure = texts.filter(r => r.state === 'done' && !r.fixed && (r.conf < 0.75 || (r.kind !== 'ignore' && !(r.amount > 0))));
-  const groups = []; for (let k = 0; k < unsure.length; k += 15) groups.push(unsure.slice(k, k + 15));
-  await pool(groups, TEXT_AT_ONCE, async g => {
-    const near = new Set(g.flatMap(r => { const k = list.indexOf(r); return list.slice(Math.max(0, k - 5), k + 6); }));
-    await doText(g, list, training, { tier: 'strong', context: list.filter(x => near.has(x)) });
-  }, () => stopped);
-  dedupeRefs(list);
-  linkGroups(list);
-}
-/* ===== self-learning from old periods (background) =====
-   Between two starting points the answer is known: next start = previous start + sent − received.
-   If my reading of that period disagrees, the strong model looks for what I misread and saves lessons. */
-const BG_SEGMENTS = 2, BG_MAX_IMAGES = 40;
-let bgBusy = false;
-const signed = c => c.amount * (c.dir === 'shop_owes' ? -1 : 1);
-async function learnFromHistory() {
-  if (bgBusy || cps.length < 2) return; bgBusy = true;
-  try {
-    const done = new Set(settings.segs || []), segs = [];
-    for (let k = cps.length - 1; k > 0 && segs.length < BG_SEGMENTS; k--) {
-      const a = cps[k - 1], b = cps[k], sig = `${chatName}|${msgs[a.i].ts}|${msgs[b.i].ts}|${a.amount}|${b.amount}`;
-      if (done.has(sig)) continue;
-      const list = allRows.slice(a.i + 1, b.i);
-      if (list.filter(r => r.img).length > BG_MAX_IMAGES) { done.add(sig); continue; }
-      segs.push({ a, b, sig, list });
-    }
-    for (const g of segs) {
-      if (stopped) break;
-      await runAnalysis(g.list);
-      const calcd = totals(g.list, signed(g.a)).debt, actual = signed(g.b);
-      if (Math.abs(actual - calcd) >= 1) {
-        const detail = g.list.filter(x => !x.sys).map(x => `#${x.i} | ${x.side === 'shop' ? 'المحل' : 'العميل'} | ${x.img ? '[صورة: ' + (x.summary || '') + ']' : (x.text || '').replace(/\n/g, ' ').slice(0, 200)} | فهمتُها: ${KIND[x.kind]} ${x.amount ?? ''} | ${x.why}`).join('\n');
-        const input = `البداية (#${g.a.i}): "${strip(msgs[g.a.i].text).slice(0, 200)}" = ${signed(g.a)}\nالبداية التالية (#${g.b.i}): "${strip(msgs[g.b.i].text).slice(0, 200)}" = ${actual}\nحسابي: ${calcd} (الفرق ${actual - calcd})\n${detail}`;
-        try {
-          const v = await ai('lessons', input, { tier: 'strong' });
-          const ls = (v?.lessons || []).map(x => String(x).trim()).filter(Boolean).slice(0, 3);
-          if (ls.length && clamp(v.confidence) >= 0.6) { for (const l of ls) examples.push({ at: Date.now(), auto: true, content: l }); persist('examples'); }
-        } catch { /* try again next time */ }
-      }
-      done.add(g.sig); settings.segs = [...done].slice(-300); settings.selfChecked = (settings.selfChecked || 0) + 1;
-      persist('settings'); renderRules();
-    }
-    await mergeOld();
-  } catch { /* background only */ }
-  bgBusy = false;
 }
 
 /* ===== merging old corrections into one summary ===== */
@@ -455,17 +288,22 @@ $('#ask').addEventListener('submit', async e => {
     const c = totals(rows, opening, openIdx), fc = finalCalc();
     v = await ai('chat', chatInput({
       rows: allRows, shopNames: senders.filter(n => shop.has(n)), clientNames: senders.filter(n => !shop.has(n)),
-      start: cp || pinnedStart != null ? { i: cp?.i ?? pinnedStart, ts: msgs[cp?.i ?? pinnedStart]?.ts } : null, opening,
+      start: openIdx >= 0 && allRows[openIdx]?.start ? { i: openIdx, ts: msgs[openIdx]?.ts } : null, opening,
       calc: `${fc.eq.text.replace(/\n/g, ' ')} (${c.debt >= 0 ? 'على العميل' : 'للعميل'})`,
-      closings: cps.map(x => ({ i: x.i, balance: x.amount * (x.dir === 'shop_owes' ? -1 : 1) })), history: talk.slice(0, -1), said,
+      closings: [], history: talk.slice(0, -1), said,
     }), { tier: 'strong' });
   } catch (x) { $('#thinking')?.remove(); say(x.message || 'تعذّر الاتصال.'); unlockTalk(); return; }
   $('#thinking')?.remove();
   const acts = cleanActions(v?.actions, { rows: allRows, senders });
   let again = false, newStart = null;
   for (const a of acts) {
-    if (a.type === 'remember') { settings.rules.push(String(a.text).trim()); persist('settings'); renderRules(); }
-    if (a.type === 'side') { if (a.side === 'shop') shop.add(a.sender); else shop.delete(a.sender); for (const r of allRows) if (r.sender === a.sender) imgCache.delete(r.i); again = true; }
+    if (a.type === 'remember') {
+      const t = String(a.text).trim();
+      if (a.scope === 'group') { settings.groups = { ...(settings.groups || {}), [chatName]: [...groupRules(), t] }; again = true; }   // applied now: read again with it
+      else settings.rules.push(t);
+      persist('settings'); renderRules();
+    }
+    if (a.type === 'side') { if (a.side === 'shop') shop.add(a.sender); else shop.delete(a.sender); again = true; }
     if (a.type === 'fix') applyFix(a.i, a.kind, a.amount, said);
     if (a.type === 'start') { newStart = a.i; pinnedOpening = null; }
     if (a.type === 'opening') pinnedOpening = num(a.amount);
@@ -477,7 +315,6 @@ $('#ask').addEventListener('submit', async e => {
 });
 
 /* ===== results ===== */
-let raf = 0; const renderSoon = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; render(); }); };
 /** The final calculation (as the shop writes it) and, for a statement, how it matches the chat. */
 function finalCalc() {
   const after = transactions(rows, { after: openIdx });
@@ -546,12 +383,6 @@ $('#list').addEventListener('click', async e => {
   if (e.target.closest('.ctl')) return;
   const act = e.target.closest('[data-act]')?.dataset.act;
   if (act === 'zoom') { $('#zoom img').src = r.url; $('#zoom').style.display = 'flex'; return; }
-  if (act === 'retry' && !busy) {
-    r.state = 'pending'; render();
-    const training = trainingText(settings, examples);
-    if (r.img) await doImage(r, rows, training); else await doText([r], rows, training);
-    render(); return;
-  }
   if (act === 'edit') { editing = editing === r.i ? null : r.i; render(); }
 });
 $('#list').addEventListener('change', e => {
@@ -567,11 +398,16 @@ $('#copy').addEventListener('click', async () => {
 
 /* ===== what it learned (rules you told it, your fixes, lessons it found itself) ===== */
 function renderRules() {
-  $('#rules').innerHTML = settings.rules.map((x, k) => `<li><span>${esc(x)}</span><button class="ghost" data-del="${k}" aria-label="احذف">حذف</button></li>`).join('');
+  const g = groupRules().map((x, k) => `<li><span>${esc(x)} <small class="note">(${esc(chatName)})</small></span><button class="ghost" data-gdel="${k}" aria-label="احذف">حذف</button></li>`);
+  $('#rules').innerHTML = g.join('') + settings.rules.map((x, k) => `<li><span>${esc(x)}</span><button class="ghost" data-del="${k}" aria-label="احذف">حذف</button></li>`).join('');
   $('#exN').textContent = [examples.length ? `${examples.length} تصحيحًا` : '', settings.selfChecked ? `راجعتُ ${settings.selfChecked} فترة بنفسي` : ''].filter(Boolean).join(' · ');
   $('#learned').value = settings.learned; show('#learned', !!settings.learned);
 }
-$('#rules').addEventListener('click', e => { const b = e.target.closest('[data-del]'); if (!b) return; settings.rules.splice(Number(b.dataset.del), 1); persist('settings'); renderRules(); });
+$('#rules').addEventListener('click', e => {
+  const g = e.target.closest('[data-gdel]');
+  if (g) { const l = groupRules().filter((_, k) => k !== Number(g.dataset.gdel)); settings.groups = { ...(settings.groups || {}), [chatName]: l }; persist('settings'); renderRules(); return; }
+  const b = e.target.closest('[data-del]'); if (!b) return; settings.rules.splice(Number(b.dataset.del), 1); persist('settings'); renderRules();
+});
 $('#learned').addEventListener('change', () => { settings.learned = $('#learned').value.trim(); persist('settings'); renderRules(); });
 
 /* ===== start ===== */

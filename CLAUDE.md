@@ -20,6 +20,12 @@ repository: `mazenalhadidy/elbshmds`. Details: `README.md`. Every change is smal
 - Input: WhatsApp export (.zip/.txt) OR pictures + pasted messages.
 - Ready-to-use Windows package: `npm --prefix ai-tool run package` → `ai-tool/release/wa-debt-checker.zip`
   (START.cmd, one bundled server file, only Node.js needed). Give him that zip when the AI tool changes.
+- **Like a Claude chat**: the whole chat (newest messages that fit: ~90k characters, up to 80 pictures, ≤ 4.4 MB) goes to
+  the strong model in ONE request (task `whole`, effort high) with its pictures named by message number. The model
+  decides who is the shop, the start, every operation and the total; the page only shows it (the total shown = the
+  sum of the operations; a different total from the model is said in the talk).
+- **Group rules**: «تذكّر» for one group/client (e.g. a percentage added to its transfers) is saved per chat name
+  (`settings.groups`) and applied at once (read again); general rules go to every chat.
 - **Everything by itself**: choosing the chat runs it all — who is the shop (AI, every chat), the start (the last
   account closing, found by meaning), every message, the final calculation. No questions, no options, little text.
   Then the owner TALKS to it («صحّح أو اسأل», task `chat`, strong model): it answers and applies actions

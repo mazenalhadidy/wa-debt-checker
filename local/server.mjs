@@ -62,8 +62,8 @@ async function ollama(body) {
   const model = t.tier === 'strong' ? cfg.ollamaModelStrong || cfg.ollamaModel : cfg.ollamaModel;
   const r = await fetch((cfg.ollamaUrl || 'http://127.0.0.1:11434') + '/api/chat', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model, stream: true, format: TASKS[t.task].schema, options: { temperature: 0, num_ctx: 16384 },
-      messages: [{ role: 'user', content: plainPrompt(t), ...(t.image ? { images: [t.image] } : {}) }] }),
+    body: JSON.stringify({ model, stream: true, format: TASKS[t.task].schema, options: { temperature: 0, num_ctx: t.task === 'whole' ? 65536 : 16384 },
+      messages: [{ role: 'user', content: plainPrompt(t) + (t.images.length ? '\n\nالصور بالترتيب: ' + t.images.map(x => '#' + x.i).join('، ') : ''), ...(t.image || t.images.length ? { images: t.image ? [t.image] : t.images.map(x => x.data) } : {}) }] }),
   });
   if (!r.ok) throw new AiError('Ollama: ' + (await r.text()).slice(0, 200) + ' — هل Ollama يعمل والنموذج مثبت؟');
   let text = '', buf = '';
