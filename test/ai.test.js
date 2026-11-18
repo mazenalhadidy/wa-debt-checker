@@ -88,3 +88,25 @@ test('closings: understands the chat by meaning (no keyword), old "checkpoints" 
   assert.deepEqual(calls[0].body.output_config.format.schema, TASKS.closings.schema);
   assert.throws(() => validate({ task: 'checkpoints', input: 'x' }), /bad task/);
 });
+
+test('the Claude key: cleaned from what copying adds, checked, shown only as a hint', async () => {
+  const { cleanKey, keyProblem, keyHint } = await import('../lib/ai.js');
+  const good = 'sk-ant-api03-' + 'A'.repeat(80) + 'xYz9';
+  assert.equal(cleanKey(` "${good}"\n`), good);
+  assert.equal(cleanKey('‏' + good + '﻿'), good);
+  assert.equal(cleanKey('Bearer ' + good), good);
+  assert.equal(keyProblem(good), '');
+  assert.match(keyProblem(''), /لا يوجد/);
+  assert.match(keyProblem('sk-ant-admin01-' + 'a'.repeat(60)), /Admin/);
+  assert.match(keyProblem('sk-ant-oat01-' + 'a'.repeat(60)), /اشتراك/);
+  assert.match(keyProblem('sk-ant-api03-abc def' + 'a'.repeat(40)), /مسافة/);
+  assert.match(keyProblem('ANTHROPIC_API_KEY'), /لا يبدو/);
+  assert.equal(keyHint(good), 'sk-ant-api03-…xYz9');
+  assert.ok(!keyHint(good).includes('AAAAAAAAAA'));                         // never the whole key
+});
+
+test('a key Claude refuses: the message names the key by its hint and what to do', async () => {
+  const { client } = fakeClient(null, { status: 401 });
+  client.apiKey = 'sk-ant-api03-' + 'B'.repeat(80) + 'q1w2';
+  await assert.rejects(runTask(client, { task: 'text', input: 'x' }), e => /sk-ant-api03-…q1w2/.test(e.message) && /console\.anthropic\.com/.test(e.message));
+});

@@ -1,7 +1,7 @@
 // /api/analyze — the page sends { task, tier, training, input, image }; this asks Claude (lib/ai.js).
 // The Anthropic key stays in Netlify's environment. Edge Function = no 10-second limit:
 // a space is sent right away and the answer when Claude finishes (never hits the 40 s header limit).
-import { makeClient, runTask, AiError, MODELS } from '../../lib/ai.js';
+import { makeClient, runTask, AiError, MODELS, keyProblem, keyHint } from '../../lib/ai.js';
 import { sameKey, json, deny } from '../../lib/http.js';
 
 export default async (req) => {
@@ -9,6 +9,8 @@ export default async (req) => {
   const password = Netlify.env.get('APP_PASSWORD'), apiKey = Netlify.env.get('ANTHROPIC_API_KEY');
   if (!password || !apiKey) return json({ error: 'ينقص الخادمَ APP_PASSWORD أو ANTHROPIC_API_KEY' }, 500);
   if (!sameKey(req.headers.get('x-app-key'), password)) return deny();
+  const bad = keyProblem(apiKey);
+  if (bad) return json({ error: `ANTHROPIC_API_KEY ${keyHint(apiKey)} في Netlify: ${bad}. بعد تصحيحه: Deploys ← Trigger deploy.` }, 500);
 
   const raw = await req.text();
   if (raw.length > 5_000_000) return json({ error: 'الطلب كبير جدًا' }, 413);

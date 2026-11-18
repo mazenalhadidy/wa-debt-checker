@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { makeClient, runTask, validate, plainPrompt, TASKS, AiError } from '../lib/ai.js';
+import { makeClient, runTask, validate, plainPrompt, TASKS, AiError, cleanKey, keyHint, keyProblem } from '../lib/ai.js';
 import { sameKey, STORE_KEYS, STORE_MAX } from '../lib/http.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -18,13 +18,33 @@ const DATA = path.join(HERE, 'data');
 const CONFIG_FILE = path.join(HERE, 'config.json');
 
 if (!fs.existsSync(CONFIG_FILE)) fs.copyFileSync(path.join(HERE, 'config.example.json'), CONFIG_FILE);
-const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+let cfg;
+try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); }
+catch (e) {
+  console.error('\nlocal\\config.json has a mistake (' + e.message + ').\nEvery value needs "quotes" and every line but the last ends with a comma, for example:\n  "password": "my-password",\n  "anthropicApiKey": "sk-ant-api03-...",\nFix it in Notepad, save, and start again.\n');
+  process.exit(1);
+}
 const PORT = Number(process.env.PORT || cfg.port || 8787);
 const ENGINE = cfg.engine === 'ollama' ? 'ollama' : 'anthropic';
 const models = { fast: cfg.modelFast || undefined, strong: cfg.modelStrong || undefined };
 for (const k of Object.keys(models)) if (!models[k]) delete models[k];
 fs.mkdirSync(DATA, { recursive: true });
-const claude = cfg.anthropicApiKey ? makeClient(cfg.anthropicApiKey) : null;
+// the key is read again whenever config.json changes: saving the file is enough, no restart needed
+let claude = null, keyAt = 0;
+function claudeClient() {
+  let st; try { st = fs.statSync(CONFIG_FILE); } catch { return claude; }
+  if (st.mtimeMs !== keyAt) {
+    keyAt = st.mtimeMs;
+    try { const k = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')).anthropicApiKey; claude = cleanKey(k) ? makeClient(k) : null; }
+    catch { console.log('local/config.json is not valid JSON (a missing comma or quote?) — the previous key stays'); }
+  }
+  return claude;
+}
+claudeClient();
+if (ENGINE === 'anthropic') {
+  const problem = keyProblem(cfg.anthropicApiKey);
+  console.log(problem ? `Claude key ${keyHint(cfg.anthropicApiKey)}: ${problem}` : `Claude key ${keyHint(cfg.anthropicApiKey)} looks right`);
+}
 
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.png': 'image/png', '.webmanifest': 'application/manifest+json', '.json': 'application/json' };
 const HEADERS = { 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
@@ -68,8 +88,9 @@ const server = http.createServer(async (req, res) => {
         const body = JSON.parse(await readBody(req, 5_000_000));
         try {
           if (ENGINE === 'ollama') return send(res, 200, await ollama(body));
-          if (!claude) throw new AiError('ضع anthropicApiKey في local/config.json', 500);
-          return send(res, 200, await runTask(claude, body, { models: { fast: models.fast || 'claude-haiku-5-5', strong: models.strong || 'claude-sonnet-5-5' } }));
+          const c = claudeClient();
+          if (!c) throw new AiError('ضع anthropicApiKey في local/config.json ثم احفظ', 500);
+          return send(res, 200, await runTask(c, body, { models: { fast: models.fast || 'claude-haiku-5-5', strong: models.strong || 'claude-sonnet-5-5' } }));
         } catch (e) {
           const offline = /fetch failed|ECONNREFUSED|ENOTFOUND|EAI_AGAIN/.test(String(e?.cause?.code || e?.message));
           return send(res, e.status === 400 ? 400 : 502, { error: offline && ENGINE === 'ollama' ? 'Ollama لا يعمل على هذا الجهاز.' : String(e.message || e), code: e.status });
